@@ -1,0 +1,20 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+
+# node
+node_modules/
+package-lock.json
+
+# secrets — never commit a deployer key
+*.key
+deployer*.json
+.env
+.env.*
+!.env.example
+
+# os
+.DS_Store
+Thumbs.db
