@@ -82,7 +82,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest tests/direct/ -q
 ```
 
-Expected: `✓ Lint passed (3 checks)` and `17 passed`.
+Expected: `✓ Lint passed (3 checks)` and `22 passed`.
 
 > Windows note: `gltest` 0.29 unlinks a temp file that is still attached to
 > stdin, which Windows refuses. The venv copy of `gltest/direct/loader.py` wraps
@@ -229,8 +229,79 @@ still open: 200 dead links fill a bounty's slots.
 
 ## Deployment
 
-Live on **GenLayer Studio Network** (chain 61999), contract
-`0xdF55FfC8b8D313cd8c64993C54Cb31825983C8c0` (v3, after all three audits).
+## Fourth audit — the steward rejection (23 Oct 2026)
+
+The Portal rejected v3, and the reason was correct:
+
+> The adjudication result is not independently bound by validator consensus.
+> Validators may accept different scores within the same 25-point band, but the
+> contract uses the exact score against an arbitrary minimum and to select the
+> best submission, so two accepted outputs can produce different verdicts or
+> winners.
+
+v3 decided two things from the raw number:
+
+```python
+passed = decision["verdict"] == PASS and score >= int(bounty.min_score)
+if passed and score > int(bounty.best_score):
+```
+
+Its equivalence rule let accepted scores differ by up to 25 points, so a
+submission scored 68 passed under one accepted output and failed under another at
+74 with `min_score = 70`; two submissions at 70 and 92 could swap places as
+winner. The tests passed because they mocked one fixed score — exactly the input a
+real adjudication does not provide.
+
+v4 removes the number from every consequence:
+
+| v3 | v4 |
+|---|---|
+| `score >= min_score` | band rank `>= min_score // 25` — the minimum is floored to a band edge |
+| `score > best_score` picks the winner | the highest band picks the winner |
+| tie broken by the raw score | equal band goes to the **earlier submission** (`s0` before `s1`) |
+| consensus: same verdict, scores within 25 | consensus: **same verdict and same band** |
+
+The band is categorical — `unusable` 0-24, `weak` 25-49, `adequate` 50-74,
+`strong` 75-100 — so a validator checks equality of the consequential value
+itself instead of a tolerance around it. `score` is still stored and returned,
+but no branch in the contract reads it: it exists so a human can see how close to
+an edge the model landed.
+
+Four tests were added for exactly this property: two scores inside one band must
+get the same verdict (`50` and `74` with `min_score = 60`), a band tie must
+ignore the higher raw number (`60` vs `74`), a band tie must go to the earlier
+submission even when the later one is judged first, and a malformed band string
+must fall back to the score rather than be read as `strong`. 22 tests, all
+passing.
+
+## Deployment
+
+Live on **GenLayer Studio Network** (chain 61999):
+
+| Version | Contract | Deploy tx |
+|---|---|---|
+| v4 (current) | `0x47344B9269e0c2c1E7cDCF77C7df01219b0c77A2` | `0xc03a0fd6…e0fa` |
+| v3 (historical, rejected by the Portal) | `0xdF55FfC8b8D313cd8c64993C54Cb31825983C8c0` | `0x0733112e…7f76` |
+
+### Matching submitted and deployed source
+
+```bash
+python scripts/verify_deployed_source.py 0x47344B9269e0c2c1E7cDCF77C7df01219b0c77A2
+```
+
+```
+local   fb4391a5b303a195ad01b3195f995a64618f92b42f56e0f7bac48a19d6696b5a 15235 B
+chain   fb4391a5b303a195ad01b3195f995a64618f92b42f56e0f7bac48a19d6696b5a 15235 B
+MATCH
+```
+
+The script reads the source back with `genlayer code`, normalises CRLF and the
+CLI's trailing blank lines, and compares digests. `stats()` on the same address
+returns `{ bounties: 0, judged: 0, submissions: 0 }`, so this is a live contract
+and not a transaction hash.
+
+### v3 run (historical)
+
 
 | Step | Transaction | Result |
 |---|---|---|
@@ -263,6 +334,9 @@ capital requirement, so it is a decision for the key holder.
 
 ## Status
 
-Lint clean, 17/17 direct tests, deployed and exercised on Studio Network with
-three adjudications (pass, fail, injection attempt), one recovered
-`UNDETERMINED`, and four attack probes. Bradbury deployment is pending testnet GEN.
+Lint clean, 22/22 direct tests. v4 is deployed on Studio Network and its source
+is verifiable against this repo with `scripts/verify_deployed_source.py`; v3 was
+exercised there with three adjudications (pass, fail, injection attempt), one
+recovered `UNDETERMINED`, and four attack probes. The Portal rejected v3 because
+the consequence read the raw score; v4 decides on the consensus-bound band only.
+Bradbury deployment is pending testnet GEN.

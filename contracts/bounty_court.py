@@ -5,7 +5,15 @@ BountyCourt — adjudication layer for bounty work.
 A poster writes a bounty with a natural-language rubric. Workers submit a URL to
 the deliverable. Anyone can trigger adjudication: validators fetch the URL, an LLM
 scores the deliverable against the rubric, and consensus is reached on the
-*decision* (verdict + score band), never on the prose of the reasoning.
+*decision*, never on the prose of the reasoning.
+
+What the decision is made of matters. Consensus here binds two categorical
+values — the verdict and the band — and nothing else. The numeric score is
+recorded for humans and is never read by the contract to decide anything: two
+accepted outputs may differ by up to one band, so a threshold on the raw number
+would let the same submission both pass and fail depending on which accepted
+output the network settled on. A band edge cannot sit inside that tolerance,
+because the tolerance is the band.
 
 The contract does not move funds. It produces a verdict that any payout rail can
 read. That keeps the money path separate from the judgment path, which is the
@@ -21,6 +29,16 @@ FAIL = "fail"
 UNJUDGED = ""
 OPEN = "open"
 CLOSED = "closed"
+
+BAND_UNUSABLE = "unusable"
+BAND_WEAK = "weak"
+BAND_ADEQUATE = "adequate"
+BAND_STRONG = "strong"
+BANDS = (BAND_UNUSABLE, BAND_WEAK, BAND_ADEQUATE, BAND_STRONG)
+
+# The equivalence rule below accepts scores that differ inside one band, so a band
+# is the smallest unit the contract may act on. 25 is that unit.
+BAND_WIDTH = 25
 
 # Limits. Each one exists because the value crosses into a prompt or a storage slot.
 MAX_TITLE = 200
@@ -43,7 +61,8 @@ class Bounty:
     min_score: u256
     status: str
     best_submission: str
-    best_score: u256
+    best_band: str
+    best_rank: u256
 
 
 @allow_storage
@@ -56,7 +75,7 @@ class Submission:
     note: str
     verdict: str
     score: u256
-    bucket: str
+    band: str
     missing: str
     judged: bool
 
@@ -90,15 +109,38 @@ class BountyCourt(gl.Contract):
             return []
         return json.loads(raw)
 
-    def _bucket_of(self, score: int) -> str:
-        # Coarse bands keep validator agreement achievable.
-        if score >= 85:
-            return "strong"
-        if score >= 60:
-            return "adequate"
-        if score >= 30:
-            return "weak"
-        return "unusable"
+    def _band_of(self, score: int) -> str:
+        # Bands are 25 wide on purpose: accepted scores are free to move inside a
+        # band, so the band is the only unit a consequence may be built from.
+        if score >= 75:
+            return BAND_STRONG
+        if score >= 50:
+            return BAND_ADEQUATE
+        if score >= 25:
+            return BAND_WEAK
+        return BAND_UNUSABLE
+
+    def _band_rank(self, band: str) -> int:
+        for i in range(len(BANDS)):
+            if BANDS[i] == band:
+                return i
+        return -1
+
+    def _min_rank(self, min_score: int) -> int:
+        # The poster's minimum is floored to a band edge, so a threshold can never
+        # sit inside the window where accepted scores are allowed to differ.
+        rank = min_score // BAND_WIDTH
+        if rank < 0:
+            return 0
+        if rank > len(BANDS) - 1:
+            return len(BANDS) - 1
+        return rank
+
+    def _sub_ord(self, submission_id: str) -> int:
+        digits = submission_id[1:]
+        if not digits.isdigit():
+            return 0
+        return int(digits)
 
     def _worker_key(self, bounty_id: str, worker: Address) -> str:
         return bounty_id + "|" + worker.as_hex
@@ -150,8 +192,11 @@ RUBRIC (the only standard you may apply):
 Score how completely the document satisfies the rubric. Credit only what is
 actually present in the document, never what it promises.
 
+The band is a coarse reading of that score: unusable = 0-24, weak = 25-49,
+adequate = 50-74, strong = 75-100.
+
 Reply with JSON only, no prose and no markdown:
-{{"score": <integer 0-100>, "verdict": "pass" or "fail", "missing": "<max 120 chars: the single most important rubric item that is absent, or empty string if nothing is missing>"}}
+{{"verdict": "pass" or "fail", "band": "unusable" or "weak" or "adequate" or "strong", "score": <integer 0-100>, "missing": "<max 120 chars: the single most important rubric item that is absent, or empty string if nothing is missing>"}}
 """
             raw = gl.nondet.exec_prompt(task, response_format="json")
             data = raw
@@ -162,17 +207,22 @@ Reply with JSON only, no prose and no markdown:
                     s = s[start:end]
                 data = json.loads(s)
             score = self._parse_score(data.get("score", 0))
+            band = str(data.get("band", "")).strip().lower()
+            if self._band_rank(band) < 0:
+                band = self._band_of(score)
             verdict = PASS if str(data.get("verdict", "")).lower() == PASS else FAIL
             missing = str(data.get("missing", ""))[:120]
             return json.dumps(
-                {"score": score, "verdict": verdict, "missing": missing}, sort_keys=True
+                {"band": band, "verdict": verdict, "missing": missing, "score": score},
+                sort_keys=True,
             )
 
         agreed = gl.eq_principle.prompt_comparative(
             leader,
-            "The two results must agree on the verdict (pass or fail) and their "
-            "scores must fall in the same 25-point band. The 'missing' field may "
-            "be worded differently as long as it names the same rubric item.",
+            "The two results must agree on the verdict (pass or fail) and on the "
+            "band (unusable, weak, adequate or strong). The numeric score and the "
+            "wording of the 'missing' field may differ; only those two categorical "
+            "values are binding.",
         )
         return json.loads(agreed)
 
@@ -212,7 +262,8 @@ Reply with JSON only, no prose and no markdown:
             min_score=u256(min_score),
             status=OPEN,
             best_submission="",
-            best_score=u256(0),
+            best_band="",
+            best_rank=u256(0),
         )
         self.submission_index[bounty_id] = "[]"
         return bounty_id
@@ -247,7 +298,7 @@ Reply with JSON only, no prose and no markdown:
             note=note,
             verdict=UNJUDGED,
             score=u256(0),
-            bucket="",
+            band="",
             missing="",
             judged=False,
         )
@@ -274,23 +325,42 @@ Reply with JSON only, no prose and no markdown:
 
         decision = self._judge(bounty.rubric, bounty.title, body[:MAX_DOCUMENT_CHARS])
 
-        score = int(decision["score"])
-        passed = decision["verdict"] == PASS and score >= int(bounty.min_score)
+        band = str(decision["band"])
+        rank = self._band_rank(band)
+        if rank < 0:
+            # Unreachable: _judge normalises the band. Kept so a malformed decision
+            # can never be read as "strong".
+            band = BAND_UNUSABLE
+            rank = 0
+
+        passed = decision["verdict"] == PASS and rank >= self._min_rank(int(bounty.min_score))
 
         sub.verdict = PASS if passed else FAIL
-        sub.score = u256(score)
-        sub.bucket = self._bucket_of(score)
+        sub.score = u256(int(decision["score"]))
+        sub.band = band
         sub.missing = str(decision["missing"])
         sub.judged = True
         self.submissions[submission_id] = sub
         self.judged_count = u256(int(self.judged_count) + 1)
 
-        # A payout rail asks one question: who passed best. Keep that answer here
-        # instead of forcing it to walk every submission.
-        if passed and score > int(bounty.best_score):
-            bounty.best_submission = submission_id
-            bounty.best_score = u256(score)
-            self.bounties[sub.bounty_id] = bounty
+        # A payout rail asks one question: who passed best. The answer is the
+        # highest band, and an equal band goes to the earlier submission. The raw
+        # score never breaks a tie, because it is the value validators may disagree
+        # on. Both inputs to this comparison are consensus-bound or immutable.
+        if passed:
+            better = False
+            if bounty.best_submission == "":
+                better = True
+            elif rank > int(bounty.best_rank):
+                better = True
+            elif rank == int(bounty.best_rank):
+                if self._sub_ord(submission_id) < self._sub_ord(bounty.best_submission):
+                    better = True
+            if better:
+                bounty.best_submission = submission_id
+                bounty.best_band = band
+                bounty.best_rank = u256(rank)
+                self.bounties[sub.bounty_id] = bounty
 
         return sub.verdict
 
@@ -314,9 +384,11 @@ Reply with JSON only, no prose and no markdown:
             "rubric": b.rubric,
             "deadline": b.deadline,
             "min_score": int(b.min_score),
+            "min_band": BANDS[self._min_rank(int(b.min_score))],
             "status": b.status,
             "best_submission": b.best_submission,
-            "best_score": int(b.best_score),
+            "best_band": b.best_band,
+            "best_rank": int(b.best_rank),
         }
 
     @gl.public.view
@@ -332,7 +404,7 @@ Reply with JSON only, no prose and no markdown:
             "note": s.note,
             "verdict": s.verdict,
             "score": int(s.score),
-            "bucket": s.bucket,
+            "band": s.band,
             "missing": s.missing,
             "judged": s.judged,
         }
